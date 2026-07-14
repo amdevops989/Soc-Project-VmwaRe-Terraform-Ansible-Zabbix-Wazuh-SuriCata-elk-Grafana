@@ -1,0 +1,154 @@
+---
+- name: "Deploy Zabbix Server 7.x, PostgreSQL, and Grafana 11.x"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    db_password: "ZabbixSecurePassword2026!"
+    zabbix_version: "7.0"
+    ubuntu_version: "24.04"
+
+  tasks:
+    # --- SECTION 1: SYSTEM PREPARATION & FIREWALL ---
+    - name: Update apt cache upfront
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Allow Zabbix and Grafana ports through UFW firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '80'    # Zabbix Frontend HTTP
+        - '10051' # Zabbix Server Trapper Port
+        - '3000'  # Grafana Dashboard UI
+
+    # --- SECTION 2: DATABASE SETUP (POSTGRESQL) ---
+    - name: Install PostgreSQL and prerequisites
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2  # Required for Ansible community.postgresql modules
+        state: present
+
+    - name: Start and enable PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Create Zabbix database user
+      community.postgresql.postgresql_user:
+        name: zabbix
+        password: "{{ db_password }}"
+        role_attr_flags: "NOSUPERUSER,NOCREATEDB,NOCREATEROLE,INHERIT,LOGIN"
+      become_user: postgres
+
+    - name: Create Zabbix database owned by zabbix user
+      community.postgresql.postgresql_db:
+        name: zabbix
+        owner: zabbix
+        encoding: 'UTF-8'
+        lc_collate: 'en_US.UTF-8'
+        lc_ctype: 'en_US.UTF-8'
+      become_user: postgres
+
+    # --- SECTION 3: REPOSITORY CONFIGURATION ---
+    - name: Download official Zabbix 7.0 repository release package
+      ansible.builtin.get_url:
+        url: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu{{ ubuntu_version }}_all.deb"
+        dest: /tmp/zabbix-release.deb
+        mode: '0644'
+
+    - name: Install Zabbix repository config deb file
+      ansible.builtin.apt:
+        deb: /tmp/zabbix-release.deb
+
+    - name: Install Grafana prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - curl
+        state: present
+
+    - name: Ensure modern GPG keyrings folder exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Grafana official GPG Key natively
+      ansible.builtin.get_url:
+        url: https://apt.grafana.com/gpg.key
+        dest: /etc/apt/keyrings/grafana.asc
+        mode: '0644'
+
+    - name: Register stable Grafana 11.x APT repository source
+      ansible.builtin.apt_repository:
+        repo: 'deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main'
+        state: present
+        update_cache: true
+
+    # --- SECTION 4: PACKAGE INSTALLATION & CORE INITIALIZATION ---
+    - name: Install Zabbix Server components and Grafana 11.x
+      ansible.builtin.apt:
+        name:
+          - zabbix-server-pg
+          - zabbix-frontend-php
+          - zabbix-nginx-conf
+          - zabbix-sql-scripts
+          - grafana
+        state: present
+
+    - name: Check if Zabbix initial schema has already been imported
+      ansible.builtin.stat:
+        path: /var/lib/zabbix/.schema_imported
+      register: zabbix_schema_state
+
+    - name: Decompress and import Zabbix initial PostgreSQL database schema
+      ansible.builtin.shell: |
+        zcat /usr/share/zabbix-sql-scripts/postgresql/server.sql.gz | PGPASSWORD="{{ db_password }}" psql -h localhost -U zabbix -d zabbix
+        touch /var/lib/zabbix/.schema_imported
+      when: not zabbix_schema_state.stat.exists
+
+    # --- SECTION 5: CONFIGURING APPLICATION SERVICES ---
+    - name: Set database password in zabbix_server.conf
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_server.conf
+        regexp: '^#? DBPassword='
+        line: "DBPassword={{ db_password }}"
+        state: present
+
+    - name: Configure Nginx default server block for Zabbix frontend
+      ansible.builtin.replace:
+        path: /etc/zabbix/nginx.conf
+        regexp: '#\s*listen\s+80;'
+        replace: 'listen 80;'
+
+    - name: Configure server_name directive in Zabbix Nginx profile
+      ansible.builtin.replace:
+        path: /etc/zabbix/nginx.conf
+        regexp: '#\s*server_name\s+example.com;'
+        replace: 'server_name 192.168.100.10;'
+
+    # --- SECTION 6: SERVICE MANAGEMENT ---
+    - name: Ensure Zabbix, Nginx, and Grafana are explicitly started and running
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: true
+      loop:
+        - zabbix-server
+        - php8.3-fpm
+        - nginx
+        - grafana-server
+
+    - name: Clean up download artifacts
+      ansible.builtin.file:
+        path: /tmp/zabbix-release.deb
+        state: absent

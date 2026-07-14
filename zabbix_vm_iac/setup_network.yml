@@ -1,0 +1,133 @@
+---
+- name: Configure Network Static IP, Permanent DNS, and Secure UFW Firewall
+  hosts: all
+  become: true
+
+  vars:
+    # Network Configurations
+    static_ip: "192.168.100.10"
+    subnet_cidr: "24"
+    gateway_ip: "192.168.100.2"
+    dns_servers:
+      - 1.1.1.1
+      - 8.8.8.8
+    
+    # Firewall configurations
+    soc_ports:
+      - { port: '22', proto: 'tcp', comment: 'Allow SSH Management' }
+      - { port: '8080', proto: 'tcp', comment: 'Allow Zabbix Frontend (Nginx)' }
+      - { port: '3000', proto: 'tcp', comment: 'Allow Grafana Dashboards' }
+
+  handlers:
+    - name: Reload UFW
+      community.general.ufw:
+        state: reloaded
+
+  tasks:
+    ## ----------------------------------------------------
+    ## STEP 1: DYNAMIC INTERFACE DETECTION & NETPLAN PROVISIONING
+    ## ----------------------------------------------------
+    - name: Gather target active network interface name
+      ansible.builtin.set_fact:
+        active_interface: "{{ ansible_default_ipv4.interface | default(ansible_interfaces[1]) }}"
+
+    - name: Ensure Netplan configuration directory exists
+      ansible.builtin.file:
+        path: /etc/netplan
+        state: directory
+        mode: '0755'
+
+    - name: Remove any existing default cloud-init or netcfg YAML files
+      ansible.builtin.shell: rm -f /etc/netplan/*.yaml /etc/netplan/*.yml
+      failed_when: false
+
+    - name: Deploy permanent static Netplan configuration with gateway and DNS
+      ansible.builtin.copy:
+        dest: /etc/netplan/01-netcfg.yaml
+        content: |
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              {{ active_interface }}:
+                dhcp4: no
+                addresses:
+                  - {{ static_ip }}/{{ subnet_cidr }}
+                routes:
+                  - to: default
+                    via: {{ gateway_ip }}
+                nameservers:
+                  addresses:
+                    {% for dns in dns_servers %}
+                    - {{ dns }}
+                    {% endfor %}
+        mode: '0600'
+
+    ## ----------------------------------------------------
+    ## STEP 2: SYSTEMD-RESOLVED DNS OVERRIDE
+    ## ----------------------------------------------------
+    - name: Clean up systemd-resolved stub symlink to regain manual DNS control
+      ansible.builtin.file:
+        path: /etc/resolv.conf
+        state: absent
+
+    - name: Recreate static immutable /etc/resolv.conf
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 1.1.1.1
+          nameserver 8.8.8.8
+        mode: '0644'
+
+    - name: Force apply netplan configurations
+      ansible.builtin.command: netplan apply
+      async: 10
+      poll: 0
+      register: netplan_apply
+
+    - name: Pause to allow network stack to re-initialize
+      ansible.builtin.pause:
+        seconds: 5
+
+    ## ----------------------------------------------------
+    ## STEP 3: UFW INSTALLATION & SOC PORT RULES
+    ## ----------------------------------------------------
+    - name: Ensure UFW package is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Configure firewall rules for SOC stack
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop: "{{ soc_ports }}"
+      notify: Reload UFW
+
+    - name: Set UFW default policies (deny incoming, allow outgoing)
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Enable UFW Firewall
+      community.general.ufw:
+        state: enabled
+
+    ## ----------------------------------------------------
+    ## STEP 4: ROUTING & CONNECTIVITY VALIDATION
+    ## ----------------------------------------------------
+    # - name: Test internet routing and DNS resolution
+    #   ansible.builtin.uri:
+    #     url: https://repo.zabbix.com
+    #     status_code: [200, 301, 302]
+    #     timeout: 10
+    #   register: internet_test
+    #   until: internet_test.status in [200, 301, 302]
+    #   retries: 3
+    #   delay: 2

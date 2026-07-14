@@ -1,0 +1,14 @@
+---
+# Host and Network Configurations
+zabbix_server_ip: "192.168.100.10"
+zabbix_web_port: 8080
+
+# Database Configurations
+db_name: "zabbix"
+db_user: "zabbix"
+db_password: "YourSecurePasswordHere" # Change this!
+
+# Package Versions
+postgresql_version: "16"
+zabbix_version: "7.0"
+php_version: "8.3"

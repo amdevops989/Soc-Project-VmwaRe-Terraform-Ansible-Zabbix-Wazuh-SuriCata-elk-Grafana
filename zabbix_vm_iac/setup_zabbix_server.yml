@@ -1,0 +1,282 @@
+---
+- name: Deploy Platform SOC - Clean Zabbix, PostgreSQL, and Grafana Stack
+  hosts: all
+  become: true
+  vars_files:
+    - vars.yml
+
+  # Crucial fix for postgresql privilege escalation temp directory issues:
+  environment:
+    ANSIBLE_REMOTE_TEMP: /var/tmp
+
+  handlers:
+    - name: Restart PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted
+
+    - name: Restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+    - name: Restart Zabbix Server
+      ansible.builtin.systemd:
+        name: zabbix-server
+        state: restarted
+
+    - name: Restart Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
+
+  tasks:
+    ## ----------------------------------------------------
+    ## STEP 0: CLEAN UP & UNINSTALL ANY PREVIOUS ZABBIX
+    ## ----------------------------------------------------
+    - name: Stop any running Zabbix services (if they exist)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      failed_when: false
+      loop:
+        - zabbix-server
+        - zabbix-agent
+        - nginx
+
+    - name: Purge existing Zabbix packages and configurations
+      ansible.builtin.apt:
+        name: "zabbix-*"
+        state: absent
+        purge: true
+      failed_when: false
+
+    - name: Remove Zabbix repository release package files
+      ansible.builtin.apt:
+        name: zabbix-release
+        state: absent
+        purge: true
+      failed_when: false
+
+    - name: Delete old configuration directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/zabbix
+        - /var/lib/zabbix
+        - /etc/nginx/sites-enabled/zabbix.conf
+        - /etc/nginx/sites-available/zabbix.conf
+        - /tmp/zabbix-release.deb
+
+    - name: Run apt-get autoremove and clean cache
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+
+## ----------------------------------------------------
+    ## STEP 1: PREREQUISITES & POSTGRESQL 16 INSTALLATION
+    ## ----------------------------------------------------
+    - name: Update apt cache and upgrade system packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+
+    - name: Install prerequisite infrastructure utilities
+      ansible.builtin.apt:
+        name:
+          - acl
+          - gpg
+          - wget
+          - python3-psycopg2
+          - nginx
+        state: present
+
+    # ---> THIS IS THE MISSING TASK <---
+    - name: Install PostgreSQL 16 and Client tools
+      ansible.builtin.apt:
+        name:
+          - "postgresql-{{ postgresql_version }}"
+          - "postgresql-client-{{ postgresql_version }}"
+        state: present
+    # ----------------------------------
+
+    - name: Ensure PostgreSQL service is running and enabled
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Create Zabbix database user in PostgreSQL
+      community.postgresql.postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        role_attr_flags: "LOGIN"
+      become_user: postgres
+
+    - name: Create Zabbix database owned by zabbix user
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+        owner: "{{ db_user }}"
+      become_user: postgres
+    ## ----------------------------------------------------
+    ## STEP 2: CLEAN ZABBIX 7.0 LTS INSTALLATION
+    ## ----------------------------------------------------
+    - name: Download official Zabbix 7.0 LTS repository package
+      ansible.builtin.get_url:
+        url: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/ubuntu/pool/main/z/zabbix-release/zabbix-release_7.0-2+ubuntu24.04_all.deb"
+        dest: "/tmp/zabbix-release.deb"
+        mode: '0644'
+
+    - name: Install clean Zabbix repository configuration via dpkg
+      ansible.builtin.command: dpkg -i /tmp/zabbix-release.deb
+      register: dpkg_result
+      changed_when: "'Installing' in dpkg_result.stdout or 'Preparing' in dpkg_result.stdout"
+
+    - name: Install Zabbix components and PHP backend matching the stack
+      ansible.builtin.apt:
+        name:
+          - zabbix-server-pgsql
+          - zabbix-frontend-php
+          - "php{{ php_version }}-pgsql"
+          - zabbix-nginx-conf
+          - zabbix-sql-scripts
+          - zabbix-agent
+        state: present
+        update_cache: true
+
+    - name: Check if Zabbix schema is already imported
+      ansible.builtin.command: >
+        psql -h localhost -U {{ db_user }} -d {{ db_name }} -c "SELECT 1 FROM users LIMIT 1;"
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      register: schema_check
+      failed_when: false
+      changed_when: false
+
+    - name: Import initial Zabbix database schema architecture
+      ansible.builtin.shell: >
+        zcat /usr/share/zabbix-sql-scripts/postgresql/server.sql.gz | psql -h localhost -U {{ db_user }} -d {{ db_name }}
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      when: schema_check.rc != 0
+
+    ## ----------------------------------------------------
+    ## STEP 3: CORE COMPONENT CONFIGURATION
+    ## ----------------------------------------------------
+    - name: Link Zabbix Server engine to PostgreSQL configurations
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_server.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#? ?DBHost=', line: 'DBHost=localhost' }
+        - { regexp: '^#? ?DBName=', line: "DBName={{ db_name }}" }
+        - { regexp: '^#? ?DBUser=', line: "DBUser={{ db_user }}" }
+        - { regexp: '^#? ?DBPassword=', line: "DBPassword={{ db_password }}" }
+      notify: Restart Zabbix Server
+
+    - name: Configure Zabbix Nginx configuration parameters
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/nginx.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^\s*#?\s*listen\s+8080;', line: "        listen {{ zabbix_web_port }};" }
+        - { regexp: '^\s*#?\s*server_name\s+example.com;', line: "        server_name {{ zabbix_server_ip }};" }
+
+    - name: Remove Nginx default landing template configurations completely
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/nginx/sites-enabled/default
+        - /etc/nginx/sites-available/default
+
+    - name: Link Zabbix Nginx configuration directly to enabled sites
+      ansible.builtin.file:
+        src: /etc/zabbix/nginx.conf
+        dest: /etc/nginx/sites-enabled/zabbix.conf
+        state: link
+      notify: Restart Nginx
+
+    - name: Ensure correct permissions on Zabbix frontend files
+      ansible.builtin.file:
+        path: /usr/share/zabbix
+        owner: www-data
+        group: www-data
+        recurse: true
+
+    - name: Verify Nginx configuration syntax before running service restart
+      ansible.builtin.command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Ensure Zabbix and Nginx services are fully running and enabled
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - zabbix-server
+        - zabbix-agent
+        - nginx
+        - "php{{ php_version }}-fpm"
+
+    ## ----------------------------------------------------
+    ## STEP 4: GRAFANA 11.X INSTALLATION & PLUGINS
+    ## ----------------------------------------------------
+    - name: Ensure keyrings directory exists securely
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Fetch and register Grafana GPG signing key
+      ansible.builtin.get_url:
+        url: https://apt.grafana.com/gpg.key
+        dest: /tmp/grafana.gpg
+        mode: '0644'
+
+    - name: De-armor Grafana GPG key into stable location
+      ansible.builtin.shell: gpg --dearmor < /tmp/grafana.gpg > /etc/apt/keyrings/grafana.gpg
+      args:
+        creates: /etc/apt/keyrings/grafana.gpg
+
+    - name: Add official Grafana OSS stable channel package repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main"
+        filename: grafana
+        state: present
+
+    - name: Install latest stable Grafana release package
+      ansible.builtin.apt:
+        name: grafana
+        state: present
+        update_cache: true
+      notify: Restart Grafana
+
+    - name: Force start Grafana engine server instances
+      ansible.builtin.meta: flush_handlers
+
+    # Task 1: Check if the plugin exists (Creates the missing variable)
+    - name: Check if Alexander Zobnin Zabbix App integration plugin is installed
+      ansible.builtin.stat:
+        path: /var/lib/grafana/plugins/alexanderzobnin-zabbix-app
+      register: zabbix_plugin
+
+    # Task 2: Install using the modern CLI if it doesn't exist
+    - name: Install Alexander Zobnin Zabbix App integration plugin
+      ansible.builtin.command: grafana cli plugins install alexanderzobnin-zabbix-app
+      args:
+        chdir: /usr/share/grafana
+      when: not zabbix_plugin.stat.exists
+      notify: Restart Grafana
+    # restart Grafana
+    - name: Ensure correct permissions for Grafana plugins directory
+      ansible.builtin.file:
+        path: /var/lib/grafana/plugins
+        owner: grafana
+        group: grafana
+        recurse: yes
+      notify: Restart Grafana

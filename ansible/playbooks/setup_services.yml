@@ -1,0 +1,38 @@
+---
+- name: Configure Monitoring and Security Services
+  hosts: all
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Configure Zabbix Agent (Server)
+      lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^Server='
+        line: 'Server=192.168.100.10'
+
+    - name: Configure Zabbix Agent (ServerActive)
+      lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^ServerActive='
+        line: 'ServerActive=192.168.100.10'
+    # NEW TASK: Set the Hostname dynamically to match the system hostname
+    - name: Configure Zabbix Agent (Hostname)
+      lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^Hostname='
+        line: "Hostname={{ ansible_hostname }}"
+    - name: Update Wazuh Manager IP
+      lineinfile:
+        path: /var/ossec/etc/ossec.conf
+        regexp: 'MANAGER_IP'
+        line: '    <address>192.168.100.30</address>'
+
+    - name: Enable and Start Services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: restarted
+      loop:
+        - zabbix-agent2
+        - wazuh-agent
+        - filebeat

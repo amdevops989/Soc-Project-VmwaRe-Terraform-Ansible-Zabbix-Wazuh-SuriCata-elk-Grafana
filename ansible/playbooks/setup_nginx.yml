@@ -1,0 +1,63 @@
+---
+- name: Deploy Demo Nginx Web Server
+  hosts: all
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Ensure apt cache is updated
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Nginx package
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    # --- FIREWALL RULES ---
+    - name: Explicitly allow Nginx traffic through UFW firewall
+      community.general.ufw:
+        rule: allow
+        name: 'Nginx Full'
+
+    # --- DEPLOY CONTENT ---
+    - name: Ensure target document root directory exists with correct permissions
+      ansible.builtin.file:
+        path: /var/www/html
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Deploy custom demo index.html page
+      ansible.builtin.copy:
+        dest: /var/www/html/index.html
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>SOC VM Demo Server</title>
+              <style>
+                  body { font-family: sans-serif; text-align: center; margin-top: 10%; background: #f4f6f9; color: #333; }
+                  .container { box-shadow: 0 4px 8px rgba(0,0,0,0.1); background: white; padding: 40px; display: inline-block; border-radius: 8px; }
+                  h1 { color: #0066cc; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>Automated Deployment Successful</h1>
+                  <p>Managed via Terraform & Ansible Pipeline</p>
+                  <hr>
+                  <p>Target Node Static IP: <strong>192.168.100.60</strong></p>
+              </div>
+          </body>
+          </html>
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Ensure Nginx is started and enabled
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: yes

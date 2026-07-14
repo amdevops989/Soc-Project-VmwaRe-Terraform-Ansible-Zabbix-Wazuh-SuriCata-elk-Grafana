@@ -1,0 +1,105 @@
+---
+- name: "Enterprise Golden Image Hardening & Agent Deployment"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    # --- SECTION 1: INITIALIZE ENVIRONMENT ---
+    - name: Force upfront APT cache update to prevent bootstrap errors
+      ansible.builtin.apt:
+        update_cache: true
+
+    # --- SECTION 2: OS HARDENING ---
+    - name: Ensure secure SSH daemon configuration rules
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 4' }
+
+    - name: Enable and configure basic UFW firewall
+      community.general.ufw:
+        state: enabled
+        policy: deny
+
+    - name: Allow default SSH entry through firewall
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    # --- SECTION 3: REPOSITORIES & AGENTS ---
+    - name: Ensure modern GPG keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Security Repository GPG Keys natively
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - { url: 'https://packages.wazuh.com/key/GPG-KEY-WAZUH', dest: '/etc/apt/keyrings/wazuh.asc' }
+        - { url: 'https://artifacts.elastic.co/GPG-KEY-elasticsearch', dest: '/etc/apt/keyrings/elastic.asc' }
+
+    - name: Fetch and install Zabbix official repository package
+      block:
+        - name: Download Zabbix release configuration package (Ubuntu 24.04)
+          ansible.builtin.get_url:
+            url: https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu24.04_all.deb
+            dest: /tmp/zabbix-release.deb
+            mode: '0644'
+
+        - name: Install Zabbix release deb file
+          ansible.builtin.apt:
+            deb: /tmp/zabbix-release.deb
+
+    - name: Register stable APT repositories with explicitly signed keys
+      block:
+        - name: Add Suricata PPA
+          ansible.builtin.apt_repository:
+            repo: 'ppa:oisf/suricata-stable'
+            state: present
+
+        - name: Add Wazuh 4.x Repo Source
+          ansible.builtin.apt_repository:
+            repo: 'deb [signed-by=/etc/apt/keyrings/wazuh.asc] https://packages.wazuh.com/4.x/apt/ stable main'
+            state: present
+            update_cache: false
+
+        - name: Add Elastic 8.x Repo Source
+          ansible.builtin.apt_repository:
+            repo: 'deb [signed-by=/etc/apt/keyrings/elastic.asc] https://artifacts.elastic.co/packages/8.x/apt stable main'
+            state: present
+            update_cache: false
+
+    - name: Run final system cache update with new repositories active
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install monitoring and security applications simultaneously
+      ansible.builtin.apt:
+        name:
+          - zabbix-agent2
+          - wazuh-agent
+          - suricata
+          - filebeat
+          - htop
+        state: present
+
+    - name: Ensure engines are enabled but dormant (prevents unique ID conflicts on clone)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: stopped
+      loop:
+        - zabbix-agent2
+        - wazuh-agent
+        - suricata
+        - filebeat

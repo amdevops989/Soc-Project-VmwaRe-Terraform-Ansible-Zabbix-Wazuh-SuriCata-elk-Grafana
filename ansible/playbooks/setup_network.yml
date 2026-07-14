@@ -1,0 +1,23 @@
+---
+- name: Configure Network Static IP
+  hosts: all
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Apply Network Configuration
+      copy:
+        dest: /etc/netplan/50-cloud-init.yaml
+        content: |
+          network:
+            version: 2
+            ethernets:
+              ens33:
+                dhcp4: false
+                addresses: [192.168.100.60/24]
+                routes: [{to: default, via: 192.168.100.2}]
+                nameservers: {addresses: [8.8.8.8]}
+
+    - name: Apply Netplan
+      command: netplan apply
+      async: 10
+      poll: 0
