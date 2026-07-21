@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # --- ELASTICSEARCH ---
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    container_name: es-light
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false # Désactivé pour économiser les ressources et simplifier le lab
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # Heap RAM bridée à 512 Mo
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    deploy:
+      resources:
+        limits:
+          memory: 1g # Limite physique du conteneur à 1 Go max
+    networks:
+      - elk-net
+
+  # --- LOGSTASH ---
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.2
+    container_name: logstash-light
+    environment:
+      - "LS_JAVA_OPTS=-Xms256m -Xmx256m" # Heap RAM bridée à 256 Mo
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports:
+      - "5044:5044" # Port d'écoute pour Filebeat
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-net
+
+  # --- KIBANA ---
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.2
+    container_name: kibana-light
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    depends_on:
+      - elasticsearch
+    networks:
+      - elk-net
+
+  # --- FILEBEAT ---
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.12.2
+    container_name: filebeat-light
+    user: root # Nécessaire pour lire les logs systèmes de l'hôte
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro # Pour parser les logs d'autres conteneurs si besoin
+      - /var/log:/var/log:ro # Pour parser les logs système de la machine virtuelle
+    deploy:
+      resources:
+        limits:
+          memory: 250m
+    depends_on:
+      - logstash
+    networks:
+      - elk-net
+
+volumes:
+  es_data:
+    driver: local
+
+networks:
+  elk-net:
+    driver: bridge

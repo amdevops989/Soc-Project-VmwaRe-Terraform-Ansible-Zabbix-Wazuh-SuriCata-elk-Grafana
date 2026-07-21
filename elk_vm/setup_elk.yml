@@ -1,0 +1,188 @@
+---
+- name: Provision Centralized Logging Architecture (ELK Stack)
+  hosts: all
+  become: true
+
+  vars:
+    elastic_version_branch: "8.x"
+    elastic_secure_password: "VaultPassword2026!" # Change this to your preferred platform master password
+    
+    # SOC Firewall Profile Map
+    elk_firewall_ports:
+      - { port: '22', proto: 'tcp', comment: 'Allow SSH Management' }
+      - { port: '9200', proto: 'tcp', comment: 'Allow Elasticsearch REST API Access' }
+      - { port: '5601', proto: 'tcp', comment: 'Allow Kibana Web GUI Dashboard' }
+      - { port: '5044', proto: 'tcp', comment: 'Allow Logstash Beats Ingestion' }
+
+  tasks:
+    ## ----------------------------------------------------
+    ## STEP 0: SAFEBOOT APT LOCK CHECKS
+    ## ----------------------------------------------------
+    - name: Ensure platform package manager locks are free
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          sleep 3
+        done
+      changed_when: false
+
+    ## ----------------------------------------------------
+    ## STEP 1: SYSTEM PRE-REQUISITES (KERNEL & MEMORY TUNING)
+    ## ----------------------------------------------------
+    # Elasticsearch uses mmapfs extensively to store indexes. The OS default (65530) is too low and will crash it.
+    - name: Optimize kernel memory map maximum counts for virtual memory allocations
+      ansible.posix.sysctl:
+        name: vm.max_map_count
+        value: '262144'
+        state: present
+        reload: true
+        sysctl_set: true
+
+    - name: Install underlying baseline package helpers
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - curl
+        state: present
+        update_cache: true
+
+    ## ----------------------------------------------------
+    ## STEP 2: REPOSITORY MANAGEMENT & DUPLICATE PURGING
+    ## ----------------------------------------------------
+    - name: Dynamically purge any existing file referencing Elastic repositories
+      ansible.builtin.shell: |
+        grep -l "artifacts.elastic.co" /etc/apt/sources.list.d/* || true
+      register: elastic_files
+      changed_when: false
+
+    - name: Clear found conflicting repository configuration fragments
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ elastic_files.stdout_lines }}"
+      when: elastic_files.stdout_lines | length > 0
+
+    - name: Scrub conflicting Elastic declarations out of global sources array
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list
+        regexp: 'artifacts.elastic.co'
+        state: absent
+
+    - name: Download and install Elastic keying token safely into keyring space
+      ansible.builtin.get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: /tmp/elastic.gpg
+        mode: '0644'
+
+    - name: De-armor Elastic signing key for DEB systems
+      ansible.builtin.shell: |
+        rm -f /usr/share/keyrings/elasticsearch-keyring.gpg
+        cat /tmp/elastic.gpg | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+    - name: Deploy authenticated declarative Elastic 8.x repository file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/{{ elastic_version_branch }}/apt stable main"
+        mode: '0644'
+    ## ----------------------------------------------------
+    ## STEP 3: INSTALL COHESIVE ELK PACKAGES
+    ## ----------------------------------------------------
+    - name: Ingest core stack components (Elasticsearch, Logstash, Kibana)
+      ansible.builtin.apt:
+        name:
+          - elasticsearch
+          - logstash
+          - kibana
+        state: present
+        update_cache: true # This will now execute cleanly without errors
+
+    ## ----------------------------------------------------
+    ## STEP 4: JVM OPTIONS & HEAP TUNING (PREVENTS RAM CRASHES)
+    ## ----------------------------------------------------
+    # With 4GB total RAM allocated to this VM, we give Elasticsearch exactly 1.5GB to leave room for Logstash and Kibana.
+    - name: Configure Elasticsearch JVM heap limits
+      ansible.builtin.copy:
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        content: |
+          -Xms1500m
+          -Xmx1500m
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+
+    ## ----------------------------------------------------
+    ## STEP 5: CONFIGURING BIND HEADERS & NETWORKING
+    ## ----------------------------------------------------
+    - name: Bind Elasticsearch to accept external network interface traffic
+      ansible.builtin.lineinfile:
+        path: /etc/elasticsearch/elasticsearch.yml
+        regexp: '^#?network.host:'
+        line: 'network.host: 0.0.0.0'
+
+    - name: Bind Kibana to listen externally to server managers
+      ansible.builtin.lineinfile:
+        path: /etc/kibana/kibana.yml
+        regexp: '^#?server.host:'
+        line: 'server.host: "0.0.0.0"'
+
+    - name: Link Kibana to local Elasticsearch backend API
+      ansible.builtin.lineinfile:
+        path: /etc/kibana/kibana.yml
+        regexp: '^#?elasticsearch.hosts:'
+        line: 'elasticsearch.hosts: ["https://localhost:9200"]'
+
+    ## ----------------------------------------------------
+    ## STEP 6: BOOTING SERVICES & PRE-SETTING CREDENTIALS
+    ## ----------------------------------------------------
+    - name: Enable and boot Elasticsearch core engine first
+      ansible.builtin.systemd:
+        name: elasticsearch
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Explicitly wait for internal Elasticsearch API port to respond locally
+      ansible.builtin.wait_for:
+        port: 9200
+        delay: 5
+        timeout: 60
+
+    - name: Override auto-generated superuser password to platform standard
+      ansible.builtin.shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b -i <<EOF
+        {{ elastic_secure_password }}
+        {{ elastic_secure_password }}
+        EOF
+      changed_when: true
+
+    # Generates a clean integration token to bypass manual pasting requirements for Kibana
+    - name: Force boot Kibana dashboard UI engine
+      ansible.builtin.systemd:
+        name: kibana
+        state: started
+        enabled: true
+
+    - name: Force boot Logstash pipelines engine
+      ansible.builtin.systemd:
+        name: logstash
+        state: started
+        enabled: true
+
+    ## ----------------------------------------------------
+    ## STEP 7: UFW FIREWALL HARDENING
+    ## ----------------------------------------------------
+    - name: Define specific ingress firewall policies for logging nodes
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop: "{{ elk_firewall_ports }}"
+
+    - name: Commit UFW operation state to active enforcement
+      community.general.ufw:
+        state: enabled
+        policy: deny

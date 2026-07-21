@@ -33,12 +33,12 @@ variable "ssh_username" {
 
 variable "vm_dhcp_ip" { 
   type    = string 
-  default = "192.168.100.60" 
+  default = "192.168.100.143" 
 }
 
 variable "vm_static_ip" { 
   type    = string 
-  default = "192.168.100.10" 
+  default = "192.168.100.20" 
 }
 
 resource "random_id" "vm_suffix" { 
@@ -46,20 +46,20 @@ resource "random_id" "vm_suffix" {
 }
 
 # --- VM Resource ---
-resource "vmworkstation_vm" "zabbix_vm" {
-  sourceid     = "5M0KMA9PN8RVLBSAFL2A2RSE77ALKN7T"
-  denomination = "zabbix-vm-${random_id.vm_suffix.hex}"
+resource "vmworkstation_vm" "elk_vm" {
+  sourceid     = "91L6RKBEQS49AKKKEL2ABUFOVURBUA28"
+  denomination = "elk-vm-${random_id.vm_suffix.hex}"
   description  = "VM managed by Terraform + Triple Playbook Pipeline"
-  path         = "/home/ironops/vmware/zabbix-vm-${random_id.vm_suffix.hex}/zabbix-vm-${random_id.vm_suffix.hex}.vmx"
+  path         = "/home/ironops/vmware/elk-vm-${random_id.vm_suffix.hex}/elk-vm-${random_id.vm_suffix.hex}.vmx"
   processors   = 2
-  memory       = 2048
+  memory       = 4096 # CRITICAL FIX: Changed from 2048 to 4096. ELK will crash with Out Of Memory errors on 2GB RAM.
 
   # STEP 1: Power On
   provisioner "local-exec" {
     command = "curl -X PUT http://localhost:8697/api/vms/${self.id}/power -H 'Accept: application/vnd.vmware.vmw.rest-v1+json' -H 'Content-Type: application/vnd.vmware.vmw.rest-v1+json' -u 'ubuntu:Lukaku@@001' -d 'on'"
   }
 
-  # STEP 2: Run Netplan Playbook (via DHCP IP)
+  # STEP 2: Run Netplan Playbook (via initial DHCP IP)
   provisioner "local-exec" {
     command = <<EOT
       sleep 20
@@ -69,36 +69,36 @@ resource "vmworkstation_vm" "zabbix_vm" {
     EOT
   }
 
-  # # STEP 3: Run Services Playbook (via New Static IP)
-  # provisioner "local-exec" {
-  #   command = <<EOT
-  #     sleep 15
-  #     ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i ${var.vm_static_ip}, \
-  #     --extra-vars "ansible_user=${var.ssh_username} ansible_password=${var.ssh_password} ansible_become_password=${var.ssh_password}" \
-  #     /home/ironops/Desktop/Soc-Vmware/ansible/playbooks/setup_services.yml
-  #   EOT
-  # }
-
-  # STEP 4: Run zabbix and grafanaPlaybook (via New Static IP)
+  # STEP 3: CRITICAL FIX - Authenticated Terminal Interceptor Loop
   provisioner "local-exec" {
     command = <<EOT
-      ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i ${var.vm_static_ip}, \
-      --extra-vars "ansible_user=${var.ssh_username} ansible_password=${var.ssh_password} ansible_become_password=${var.ssh_password}" \
-      setup_zabbix_server.yml
+      echo "Validating stable authenticated SSH terminal access on ${var.vm_static_ip}..."
+      sleep 5
+      for i in {1..20}; do
+        SSHPASS="${var.ssh_password}" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 ${var.ssh_username}@${var.vm_static_ip} "echo TerminalReady" && exit 0
+        echo "Network interface settling down... Retrying terminal authentication hook."
+        sleep 4
+      done
+      echo "Failed to verify stable SSH terminal runtime environment on static endpoint." && exit 1
     EOT
   }
 
-  # STEP 5: Clean Shutdown
+  # STEP 4: CRITICAL FIX - Run ELK Deployment Playbook with clean SSH arguments
   # provisioner "local-exec" {
-  #   command = "curl -X PUT http://localhost:8697/api/vms/${self.id}/power -H 'Accept: application/vnd.vmware.vmw.rest-v1+json' -H 'Content-Type: application/vnd.vmware.vmw.rest-v1+json' -u 'ubuntu:Lukaku@@001' -d 'off'"
+  #   command = <<EOT
+  #     ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i ${var.vm_static_ip}, \
+  #     --extra-vars "ansible_user=${var.ssh_username} ansible_password=${var.ssh_password} ansible_become_password=${var.ssh_password}" \
+  #     --ssh-extra-args="-o ControlMaster=no -o ControlPath=none" \
+  #     setup_elk.yml
+  #   EOT
   # }
 }
 
 # --- Outputs ---
 output "vm_id" { 
-  value = vmworkstation_vm.zabbix_vm.id 
+  value = vmworkstation_vm.elk_vm.id 
 }
 
 output "vm_name" { 
-  value = vmworkstation_vm.zabbix_vm.denomination 
+  value = vmworkstation_vm.elk_vm.denomination 
 }

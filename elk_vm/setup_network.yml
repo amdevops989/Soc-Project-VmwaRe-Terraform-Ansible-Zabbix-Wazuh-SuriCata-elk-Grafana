@@ -1,0 +1,93 @@
+---
+- name: Configure Network Static IP and Permanent DNS
+  hosts: all
+  become: true
+
+  vars:
+    static_ip: "192.168.100.20"
+    subnet_cidr: "24"
+    gateway_ip: "192.168.100.2"
+    dns_servers:
+      - 1.1.1.1
+      - 8.8.8.8
+
+  tasks:
+    ## ----------------------------------------------------
+    ## STEP 1: DYNAMIC INTERFACE DETECTION & NETPLAN PROVISIONING
+    ## ----------------------------------------------------
+    - name: Gather target active network interface name
+      ansible.builtin.set_fact:
+        active_interface: "{{ ansible_default_ipv4.interface | default(ansible_interfaces[1]) }}"
+
+    - name: Ensure Netplan configuration directory exists
+      ansible.builtin.file:
+        path: /etc/netplan
+        state: directory
+        mode: '0755'
+
+    - name: Remove any existing default cloud-init or netcfg YAML files
+      ansible.builtin.shell: rm -f /etc/netplan/*.yaml /etc/netplan/*.yml
+      failed_when: false
+      changed_when: true
+
+    - name: Deploy permanent static Netplan configuration with gateway and DNS
+      ansible.builtin.copy:
+        dest: /etc/netplan/01-netcfg.yaml
+        content: |
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              {{ active_interface }}:
+                dhcp4: no
+                addresses:
+                  - {{ static_ip }}/{{ subnet_cidr }}
+                routes:
+                  - to: default
+                    via: {{ gateway_ip }}
+                nameservers:
+                  addresses:
+                    {% for dns in dns_servers %}
+                    - {{ dns }}
+                    {% endfor %}
+        mode: '0600'
+
+    ## ----------------------------------------------------
+    ## STEP 2: SYSTEMD-RESOLVED DNS CONFIGURATION
+    ## ----------------------------------------------------
+    - name: Ensure systemd-resolved directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure upstream resolvers for systemd-resolved
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/dns_override.conf
+        content: |
+          [Resolve]
+          DNS=1.1.1.1 8.8.8.8
+          DNSStubListener=yes
+        mode: '0644'
+
+    - name: Force link system resolution target to systemd-resolved manager stub
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: true
+
+    - name: Restart systemd-resolved to apply DNS changes
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+        enabled: true
+
+    ## ----------------------------------------------------
+    ## STEP 3: ASYNCHRONOUS IP CUTOVER & NETWORK REFRESH
+    ## ----------------------------------------------------
+    - name: Schedule Netplan application asynchronously
+      ansible.builtin.shell: |
+        nohup sh -c "netplan apply && systemctl restart systemd-networkd" > /dev/null 2>&1 &
+      async: 5
+      poll: 0

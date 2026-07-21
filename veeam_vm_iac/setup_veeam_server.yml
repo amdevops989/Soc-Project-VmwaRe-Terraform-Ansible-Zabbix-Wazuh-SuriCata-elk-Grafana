@@ -1,0 +1,141 @@
+---
+- name: Deploy Bulletproof Veeam Agent Across VM Fleet
+  hosts: all
+  become: true
+
+  vars:
+    nfs_server_ip: "192.168.100.1"
+    nfs_export_path: "/srv/veeam_backups"
+    veeam_repo_name: "NFS_Host_Repository"
+    veeam_job_name: "backup-{{ inventory_hostname }}-to-host"
+    backup_retention_points: 7
+    automation_log_path: "/var/log/veeam_automation.log"
+
+    soc_ports:
+      - { port: '22', proto: 'tcp', comment: 'Allow SSH Management' }
+      - { port: '6106', proto: 'tcp', comment: 'Allow Veeam Agent for Linux Service Port' }
+      - { port: '10050', proto: 'tcp', comment: 'Allow Zabbix Agent Monitoring' }
+
+  tasks:
+    ## ----------------------------------------------------
+    ## STEP 0: PREVENT APT LOCK HANGS (SAFEBOOT)
+    ## ----------------------------------------------------
+    - name: Wait for background cloud-init or unattended-upgrades to release apt locks
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          echo "Waiting for background update processes to release apt lock..."
+          sleep 3
+        done
+      changed_when: false
+
+    ## ----------------------------------------------------
+    ## STEP 1: UFW FIREWALL CONFIGURATION
+    ## ----------------------------------------------------
+    - name: Ensure UFW package is installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Stage UFW default policies while disabled
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Stage essential pipeline management ports
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop: "{{ soc_ports }}"
+
+    - name: Enable UFW Firewall with runtime rules staged
+      community.general.ufw:
+        state: enabled
+
+    ## ----------------------------------------------------
+    ## STEP 2: KERNEL HEADERS & COMPILATION TOOLCHAIN
+    ## ----------------------------------------------------
+    - name: Ensure exact running kernel matching headers and compilation tools are active
+      ansible.builtin.apt:
+        name:
+          - nfs-common
+          - linux-headers-{{ ansible_kernel }}
+          - build-essential
+          - dkms
+        state: present
+        update_cache: true
+
+    - name: Clean broken installations and reset system package engine states
+      ansible.builtin.shell: |
+        apt-get purge -y veeamsnap blksnap veeam veeam-libs || true
+        apt-get autoremove -y
+        apt-get install -f -y
+      changed_when: true
+
+    ## ----------------------------------------------------
+    ## STEP 3: OFFICIAL VEEAM REPOSITORY INGESTION & TRACKING
+    ## ----------------------------------------------------
+    - name: Download official Veeam release package
+      ansible.builtin.get_url:
+        url: https://repository.veeam.com/backup/linux/agent/dpkg/debian/public/pool/veeam/v/veeam-release-deb/veeam-release-deb_1.0.11_amd64.deb
+        dest: /tmp/veeam-release.deb
+        mode: '0644'
+
+    - name: Install Veeam repository configuration package
+      ansible.builtin.apt:
+        deb: /tmp/veeam-release.deb
+        state: present
+
+    - name: Install blksnap, veeam-libs, and veeam binary stack
+      ansible.builtin.apt:
+        name:
+          - blksnap
+          - veeam-libs
+          - veeam
+        state: present
+        update_cache: true
+
+    ## ----------------------------------------------------
+    ## STEP 4: KERNEL DRIVER RE-LINK & LINK VERIFICATION
+    ## ----------------------------------------------------
+    - name: Force DKMS to compile and bind the snapshot module engine to current kernel
+      ansible.builtin.shell: |
+        DKMS_VER=$(dkms status | grep blksnap | awk -F', ' '{print $1}' | awk -F'/' '{print $2}' | head -n 1)
+        if [ ! -z "$DKMS_VER" ]; then
+          dkms install -m blksnap -v "$DKMS_VER" -k {{ ansible_kernel }} --force || true
+        fi
+        depmod -a {{ ansible_kernel }}
+      changed_when: true
+
+    - name: Load modern Veeam block kernel snapshot infrastructure driver
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - veeamblksnap
+        - bdevfilter
+      failed_when: false # Prevents compilation warnings from breaking your continuous integration loop
+
+    ## ----------------------------------------------------
+    ## STEP 5: DAEMON ORCHESTRATION & VALIDATION
+    ## ----------------------------------------------------
+    - name: Force systemd daemon reload to scan new Veeam service structures
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Ensure veeamservice daemon is enabled and explicitly restarted
+      ansible.builtin.systemd:
+        name: veeamservice
+        state: restarted
+        enabled: true
+
+    - name: Wait for Veeam service socket to stabilize
+      ansible.builtin.wait_for:
+        path: /var/run/veeam/veeamservice.sock
+        state: present
+        timeout: 45

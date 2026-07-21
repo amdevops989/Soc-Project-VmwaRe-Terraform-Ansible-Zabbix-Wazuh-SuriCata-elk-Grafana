@@ -1,0 +1,9 @@
+filebeat.inputs:
+- type: filestream
+  id: sys-logs
+  enabled: true
+  paths:
+    - /var/log/*.log # Collecte les logs de la VM
+
+output.logstash:
+  hosts: ["logstash:5044"]
